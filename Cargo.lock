@@ -3959,7 +3959,7 @@ dependencies = [
 
 [[package]]
 name = "grim"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "android-activity",
  "android_logger",
