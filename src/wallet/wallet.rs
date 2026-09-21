@@ -386,6 +386,9 @@ impl Wallet {
 					self.account_time
 						.store(Utc::now().timestamp(), Ordering::Relaxed);
 
+					// Mark wallet as open.
+					self.is_open.store(true, Ordering::Relaxed);
+
 					// Start new synchronization thread or wake up existing one.
 					let mut thread_w = self.sync_thread.write();
 					if thread_w.is_none() {
@@ -394,7 +397,6 @@ impl Wallet {
 					} else {
 						thread_w.clone().unwrap().unpark();
 					}
-					self.is_open.store(true, Ordering::Relaxed);
 				}
 				Err(e) => {
 					if !self.syncing() {
