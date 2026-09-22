@@ -15,7 +15,8 @@
 use crate::AppConfig;
 use crate::gui::Colors;
 use crate::gui::icons::{
-	ARROWS_CLOCKWISE, FILE_ARROW_DOWN, FILE_ARROW_UP, FILE_TEXT, GEAR_FINE, POWER, STACK,
+	ARROWS_CLOCKWISE, ARROWS_LEFT_RIGHT, FILE_ARROW_DOWN, FILE_ARROW_UP, FILE_TEXT, GEAR_FINE,
+	POWER, STACK,
 };
 use crate::gui::platform::PlatformCallbacks;
 use crate::gui::views::types::{LinePosition, ModalPosition};
@@ -35,8 +36,20 @@ use egui::scroll_area::ScrollBarVisibility;
 use egui::{Id, Margin, RichText, ScrollArea};
 use grin_chain::SyncStatus;
 
+#[derive(Clone, Copy, Default)]
+enum Tab {
+	#[default]
+	Transactions,
+	Swaps,
+	Settings,
+}
+
 /// Wallet content.
 pub struct WalletContent {
+	tabs: std::collections::HashMap<String, Tab>,
+	account_id: Option<String>,
+	swap_views: std::collections::HashMap<String, super::swaps::SwapContent>,
+	swaps_content: Option<super::swaps::SwapContent>,
 	/// Current wallet identifier.
 	wallet_id: Option<String>,
 
@@ -86,11 +99,22 @@ impl WalletContentContainer for WalletContent {
 	}
 
 	fn container_ui(&mut self, ui: &mut egui::Ui, wallet: &Wallet, cb: &dyn PlatformCallbacks) {
+		self.swap_views.retain(|_, content| content.alive());
 		let wallet_id = Some(wallet.identifier());
 		if wallet_id != self.wallet_id {
+			self.remember_tab();
+			self.hide_swaps();
 			self.wallet_id = wallet_id;
-			self.txs_content = Some(WalletTransactionsContent::new(None));
+			let account_id = wallet.account_id();
+			let tab = self.tabs.get(&account_id).copied().unwrap_or_default();
+			self.account_id = Some(account_id);
+			self.txs_content = None;
 			self.settings_content = None;
+			match tab {
+				Tab::Transactions => self.open_txs(),
+				Tab::Swaps => self.open_swaps(wallet),
+				Tab::Settings => self.open_settings(),
+			}
 		}
 
 		let dual_panel = Content::is_dual_panel_mode(ui.ctx());
@@ -104,6 +128,7 @@ impl WalletContentContainer for WalletContent {
 		// scanner is not showing and wallet data is not empty.
 		let mut show_account = wallet.synced_from_node()
 			&& self.settings_content.is_none()
+			&& self.swaps_content.is_none()
 			&& !block_nav
 			&& !wallet.sync_error()
 			&& data.is_some();
@@ -258,7 +283,9 @@ impl WalletContentContainer for WalletContent {
 				let show_txs = self.txs_content.is_some() && !top_panel_expanded;
 				let show_sync = (!show_settings || block_nav) && sync_ui(ui, &wallet);
 				if !show_sync {
-					if show_settings {
+					if let Some(swaps) = self.swaps_content.as_mut() {
+						swaps.ui(ui, wallet, cb);
+					} else if show_settings {
 						ui.add_space(3.0);
 						ScrollArea::vertical()
 							.id_salt(Id::from("wallet_tab_content_scroll").with(wallet_id))
@@ -300,7 +327,11 @@ impl WalletContentContainer for WalletContent {
 impl Default for WalletContent {
 	fn default() -> Self {
 		Self {
+			tabs: Default::default(),
 			wallet_id: None,
+			account_id: None,
+			swap_views: Default::default(),
+			swaps_content: None,
 			txs_content: None,
 			settings_content: None,
 			account_content: WalletAccountContent::default(),
@@ -312,6 +343,56 @@ impl Default for WalletContent {
 }
 
 impl WalletContent {
+	fn open_txs(&mut self) {
+		self.hide_swaps();
+		self.settings_content = None;
+		self.txs_content = Some(WalletTransactionsContent::new(None));
+	}
+
+	fn open_settings(&mut self) {
+		self.hide_swaps();
+		self.txs_content = None;
+		self.settings_content = Some(WalletSettingsContent::default());
+	}
+
+	fn current_tab(&self) -> Tab {
+		if self.swaps_content.is_some() {
+			Tab::Swaps
+		} else if self.settings_content.is_some() {
+			Tab::Settings
+		} else {
+			Tab::Transactions
+		}
+	}
+
+	fn remember_tab(&mut self) {
+		if let Some(id) = &self.account_id {
+			let tab = self.current_tab();
+			self.tabs.insert(id.clone(), tab);
+		}
+	}
+
+	fn open_swaps(&mut self, wallet: &Wallet) {
+		self.settings_content = None;
+		self.txs_content = None;
+		if self.swaps_content.is_none() {
+			let swaps = match self.swap_views.remove(&wallet.account_id()) {
+				Some(mut swaps) => {
+					swaps.resume(wallet);
+					swaps
+				}
+				None => super::swaps::SwapContent::new(wallet),
+			};
+			self.swaps_content = Some(swaps);
+		}
+	}
+
+	fn hide_swaps(&mut self) {
+		if let (Some(id), Some(content)) = (&self.account_id, self.swaps_content.take()) {
+			self.swap_views.insert(id.clone(), content);
+		}
+	}
+
 	/// Get title based on current navigation state.
 	pub fn title(&self) -> impl Into<String> {
 		if self.account_content.qr_scan_showing() {
@@ -322,6 +403,8 @@ impl WalletContent {
 			t!("wallets.transport")
 		} else if self.transport_content.qr_address_content.is_some() {
 			t!("network_mining.address")
+		} else if self.swaps_content.is_some() {
+			t!("swaps.title")
 		} else if self.settings_content.is_some() {
 			t!("wallets.settings")
 		} else {
@@ -367,13 +450,14 @@ impl WalletContent {
 				false
 			};
 
-			let tabs_amount = if can_send { 5 } else { 4 };
+			let tabs_amount = if can_send { 6 } else { 5 };
 			ui.columns(tabs_amount, |columns| {
 				columns[0].vertical_centered_justified(|ui| {
-					let active = self.settings_content.is_none() && self.txs_content.is_some();
+					let active = self.swaps_content.is_none()
+						&& self.settings_content.is_none()
+						&& self.txs_content.is_some();
 					View::tab_button(ui, STACK, None, Some(active), |_| {
-						self.txs_content = Some(WalletTransactionsContent::new(None));
-						self.settings_content = None;
+						self.open_txs();
 					});
 				});
 				let active = if wallet.synced_from_node() && data.is_some() {
@@ -389,8 +473,7 @@ impl WalletContent {
 						let (icon, color) = (FILE_ARROW_DOWN, Some(Colors::green()));
 						View::tab_button(ui, icon, color, active, |_| {
 							if self.txs_content.is_none() {
-								self.txs_content = Some(WalletTransactionsContent::new(None));
-								self.settings_content = None;
+								self.open_txs();
 							}
 							self.txs_content.as_mut().unwrap().message_content = None;
 
@@ -410,8 +493,7 @@ impl WalletContent {
 						let (icon, color) = (FILE_TEXT, Some(Colors::gold_dark()));
 						View::tab_button(ui, icon, color, active, |_| {
 							if self.txs_content.is_none() {
-								self.txs_content = Some(WalletTransactionsContent::new(None));
-								self.settings_content = None;
+								self.open_txs();
 							}
 							self.txs_content.as_mut().unwrap().message_content =
 								Some(MessageInputContent::default());
@@ -431,8 +513,7 @@ impl WalletContent {
 							let (icon, color) = (FILE_ARROW_UP, Some(Colors::red()));
 							View::tab_button(ui, icon, color, active, |_| {
 								if self.txs_content.is_none() {
-									self.txs_content = Some(WalletTransactionsContent::new(None));
-									self.settings_content = None;
+									self.open_txs();
 								}
 								self.txs_content.as_mut().unwrap().message_content = None;
 
@@ -445,12 +526,22 @@ impl WalletContent {
 						}
 					});
 				}
+				columns[tabs_amount - 2].vertical_centered_justified(|ui| {
+					View::tab_button(
+						ui,
+						ARROWS_LEFT_RIGHT,
+						None,
+						Some(self.swaps_content.is_some()),
+						|_| {
+							self.open_swaps(wallet);
+						},
+					);
+				});
 				columns[tabs_amount - 1].vertical_centered_justified(|ui| {
 					let active = self.settings_content.is_some();
 					View::tab_button(ui, GEAR_FINE, None, Some(active), |ui| {
 						ExternalConnection::check(None, ui.ctx());
-						self.txs_content = None;
-						self.settings_content = Some(WalletSettingsContent::default());
+						self.open_settings();
 					});
 				});
 			});

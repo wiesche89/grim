@@ -323,7 +323,7 @@ impl WalletTransactionContent {
 		let on_click = (false, || {});
 		WalletTransactionsContent::tx_item_ui(ui, tx, rect, bg, rounding, &data, on_click, |ui| {
 			// Show button to delete transaction from database.
-			if tx.data.confirmed || tx.cancelled() {
+			if tx.can_delete() {
 				let r = View::item_rounding(0, 2, true);
 				View::item_button(ui, r, FILE_X, Some(Colors::inactive_text()), || {
 					on_delete(tx.data.id);
@@ -341,7 +341,7 @@ impl WalletTransactionContent {
 				}
 				return;
 			}
-			if !tx.cancelled() && !tx.cancelling() && !tx.posting() {
+			if tx.swap.is_none() && !tx.cancelled() && !tx.cancelling() && !tx.posting() {
 				let repeat = tx.broadcasting_timed_out(&wallet);
 				// Draw button to cancel transaction.
 				if tx.can_cancel() || repeat {

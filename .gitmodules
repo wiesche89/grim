@@ -1,7 +1,7 @@
 [submodule "wallet"]
 	path = wallet
-	url = https://code.gri.mw/ardocrat/wallet
-	branch = grim
+	url = https://github.com/wiesche89/grin-wallet.git
+	branch = atomic_swaps
 [submodule "tor/webtunnel"]
 	path = tor/webtunnel
 	url = https://code.gri.mw/WEB/webtunnel

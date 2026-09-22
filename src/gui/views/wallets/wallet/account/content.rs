@@ -159,7 +159,12 @@ impl WalletAccountContent {
 				cb.start_camera();
 			});
 
-			// Draw button to show list of accounts.
+			// Keep the active swap bound to its account
+			if wallet.swap_active() {
+				ui.label(t!("swaps.account_locked"));
+				return;
+			}
+			// Draw button to show list of accounts
 			let accounts = wallet.accounts();
 			let accounts_icon = if accounts.len() > 1 {
 				USERS_THREE

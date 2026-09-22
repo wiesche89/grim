@@ -23,3 +23,6 @@ pub use common::CommonSettings;
 
 mod recovery;
 pub use recovery::RecoverySettings;
+
+mod swaps;
+pub use swaps::SwapSettings;

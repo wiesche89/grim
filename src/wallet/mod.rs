@@ -34,3 +34,5 @@ pub use utils::WalletUtils;
 
 mod seed;
 pub mod store;
+
+pub mod swaps;

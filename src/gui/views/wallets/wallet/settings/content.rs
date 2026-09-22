@@ -20,6 +20,8 @@ use crate::wallet::Wallet;
 
 /// Wallet settings tab content.
 pub struct WalletSettingsContent {
+	/// Atomic swap settings
+	swaps: super::SwapSettings,
 	/// Common setup content.
 	common_setup: CommonSettings,
 	/// Connection setup content.
@@ -31,6 +33,7 @@ pub struct WalletSettingsContent {
 impl Default for WalletSettingsContent {
 	fn default() -> Self {
 		Self {
+			swaps: Default::default(),
 			common_setup: CommonSettings::default(),
 			conn_setup: ConnectionSettings::default(),
 			recovery_setup: RecoverySettings::default(),
@@ -55,6 +58,8 @@ impl WalletSettingsContent {
 				wallet.close();
 			}
 		}
+
+		self.swaps.ui(ui, wallet, cb);
 
 		// Show wallet recovery setup.
 		self.recovery_setup.ui(ui, wallet, cb);

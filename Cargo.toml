@@ -44,6 +44,7 @@ grin_wallet_api = { path = "wallet/api"}
 grin_wallet_libwallet = { path = "wallet/libwallet" }
 grin_wallet_util = { path = "wallet/util" }
 grin_wallet_controller = { path = "wallet/controller" }
+grin_wallet_config = { path = "wallet/config" }
 
 ## ui
 egui = { version = "0.33.3", default-features = false }

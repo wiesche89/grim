@@ -211,6 +211,7 @@ pub enum WalletTxAction {
 /// Wallet transaction data.
 #[derive(Clone)]
 pub struct WalletTx {
+	pub swap: Option<super::swaps::SwapTx>,
 	/// Information from database.
 	pub data: TxLogEntry,
 	/// Payment proof.
@@ -261,6 +262,7 @@ impl WalletTx {
 			}
 		}
 		let t = Self {
+			swap: tx.swap.as_ref().map(|s| s.kind),
 			data: tx,
 			proof,
 			amount,
@@ -319,12 +321,18 @@ impl WalletTx {
 
 	/// Check if transaction can be cancelled.
 	pub fn can_cancel(&self) -> bool {
-		!self.cancelling()
+		self.swap.is_none()
+			&& !self.cancelling()
 			&& !self.data.confirmed
 			&& !self.broadcasting()
 			&& (!self.sending_tor() || self.action_error.is_some())
 			&& self.data.tx_type != TxLogEntryType::TxReceivedCancelled
 			&& self.data.tx_type != TxLogEntryType::TxSentCancelled
+	}
+
+	/// Swap records are retained for settlement and recovery
+	pub fn can_delete(&self) -> bool {
+		self.swap.is_none() && (self.data.confirmed || self.cancelled())
 	}
 
 	/// Check if transaction was canceled.

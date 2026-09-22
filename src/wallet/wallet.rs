@@ -67,6 +67,8 @@ use uuid::Uuid;
 /// Contains wallet instance, configuration and state, handles wallet commands.
 #[derive(Clone)]
 pub struct Wallet {
+	swaps: Arc<RwLock<Option<super::swaps::Service>>>,
+	swap_gate: Arc<Mutex<()>>,
 	/// Wallet configuration.
 	config: Arc<RwLock<WalletConfig>>,
 	/// Wallet instance, initializing on wallet opening and clearing on wallet closing.
@@ -154,6 +156,8 @@ impl Wallet {
 	fn new(config: WalletConfig) -> Self {
 		let connection = config.connection();
 		Self {
+			swaps: Arc::new(RwLock::new(None)),
+			swap_gate: Arc::new(Mutex::new(())),
 			config: Arc::new(RwLock::new(config)),
 			instance: Arc::new(RwLock::new(None)),
 			connection: Arc::new(RwLock::new(connection)),
@@ -188,6 +192,59 @@ impl Wallet {
 			tasks_sender: Arc::new(RwLock::new(None)),
 			task_result: Arc::new(RwLock::new(None)),
 		}
+	}
+
+	/// Get the account service without restarting failed initialization
+	pub fn swap_service(&self) -> super::swaps::Service {
+		let account = self.get_config().account;
+		if let Some(service) = self.swaps.read().as_ref().filter(|s| s.account == account) {
+			return service.clone();
+		}
+		let mut current = self.swaps.write();
+		if let Some(service) = current.as_ref().filter(|s| s.account == account) {
+			return service.clone();
+		}
+		current
+			.insert(super::swaps::Service::start(self.clone()))
+			.clone()
+	}
+
+	/// Retry a stopped service after an explicit retry or wallet unlock
+	pub fn retry_swaps(&self) -> super::swaps::Service {
+		let account = self.get_config().account;
+		let mut current = self.swaps.write();
+		if let Some(service) = current
+			.as_ref()
+			.filter(|s| s.account == account && s.alive())
+		{
+			return service.clone();
+		}
+		current
+			.insert(super::swaps::Service::start(self.clone()))
+			.clone()
+	}
+
+	/// Whether this wallet can run swaps
+	pub fn swaps_enabled(&self) -> bool {
+		self.get_config().chain_type == grin_core::global::ChainTypes::Testnet
+	}
+
+	pub fn swap_active(&self) -> bool {
+		self.swaps.read().as_ref().is_some_and(|s| s.active())
+	}
+
+	pub(crate) fn swap_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+		self.swap_gate.lock()
+	}
+
+	pub(crate) fn swap_instance(&self) -> Result<WalletInstance, Error> {
+		if !self.is_open() {
+			return Err(Error::GenericError("Wallet is locked".into()));
+		}
+		self.instance
+			.read()
+			.clone()
+			.ok_or_else(|| Error::GenericError("Wallet is closed".into()))
 	}
 
 	/// Create new wallet.
@@ -383,18 +440,23 @@ impl Wallet {
 					let wallet_inst = lc.wallet_inst()?;
 					let label = self.get_config().account.to_owned();
 					wallet_inst.set_parent_key_id_by_name(label.as_str())?;
+					super::swaps::import_records(
+						wallet_inst,
+						self.keychain_mask().as_ref(),
+						&self.get_config().get_data_path().join("swaps"),
+					)?;
 					self.account_time
 						.store(Utc::now().timestamp(), Ordering::Relaxed);
 
-					// Start new synchronization thread or wake up existing one.
+					// Publish the open state before the sync thread can run
 					let mut thread_w = self.sync_thread.write();
+					self.is_open.store(true, Ordering::Relaxed);
 					if thread_w.is_none() {
 						let thread = start_sync(self.clone());
 						*thread_w = Some(thread);
 					} else {
 						thread_w.clone().unwrap().unpark();
 					}
-					self.is_open.store(true, Ordering::Relaxed);
 				}
 				Err(e) => {
 					if !self.syncing() {
@@ -408,6 +470,9 @@ impl Wallet {
 
 		// Update Slatepack address.
 		self.update_slatepack_addr()?;
+		if self.swaps_enabled() {
+			self.retry_swaps();
+		}
 
 		Ok(())
 	}
@@ -443,9 +508,16 @@ impl Wallet {
 
 	/// Get unique opened wallet identifier, including current account.
 	pub fn identifier(&self) -> String {
+		format!(
+			"{}_{}",
+			self.account_id(),
+			self.account_time.load(Ordering::Relaxed)
+		)
+	}
+
+	pub fn account_id(&self) -> String {
 		let config = self.get_config();
-		let account_ts = self.account_time.load(Ordering::Relaxed);
-		format!("{}_{}_{}", config.id, config.account.to_hex(), account_ts)
+		format!("{}_{}", config.id, config.account.to_hex())
 	}
 
 	/// Get Slatepack address to receive txs at transport.
@@ -586,6 +658,7 @@ impl Wallet {
 			// Stop running Tor service.
 			Tor::stop_service(&service_id);
 			// Close the wallet.
+			let _swap_guard = wallet_close.swap_lock();
 			let r_inst = wallet_close.instance.as_ref().read();
 			let instance = r_inst.clone().unwrap();
 			Self::close_wallet(&instance);
@@ -677,12 +750,25 @@ impl Wallet {
 		let lc = wallet_lock.lc_provider()?;
 		let w = lc.wallet_inst()?;
 		let parent_key_id = w.parent_key_id();
-		// Retrieve txs from database.
+		// Shared movements belong to the swap, not the account's payment history
+		let mut shared = std::collections::HashSet::new();
+		let mut owned = std::collections::HashSet::new();
+		for output in w.iter()?.filter(|out| out.root_key_id == parent_key_id) {
+			if let Some(id) = output.tx_log_entry {
+				if output.is_multisig {
+					shared.insert(id);
+				} else {
+					owned.insert(id);
+				}
+			}
+		}
 		let txs: Vec<TxLogEntry> = w
 			.tx_log_iter()?
 			.filter(|tx| tx.is_ok())
 			.map(|tx| tx.unwrap())
 			.filter(|tx_entry| tx_entry.parent_key_id == parent_key_id)
+			.filter(super::swaps::visible)
+			.filter(|tx| tx.swap.is_some() || !shared.contains(&tx.id) || owned.contains(&tx.id))
 			// Filter transactions to not show txs without slate (usually unspent outputs).
 			.filter(|tx| {
 				tx.tx_slate_id.is_some() || (tx.tx_slate_id.is_none() && tx.payment_proof.is_some())
@@ -747,7 +833,9 @@ impl Wallet {
 				.collect()
 		};
 		for t in &txs {
-			self.delete_tx(t.id)?;
+			if t.swap.is_none() {
+				self.delete_tx(t.id)?;
+			}
 		}
 		Ok(())
 	}
@@ -792,6 +880,12 @@ impl Wallet {
 
 	/// Set active account from provided label.
 	pub fn set_active_account(&self, label: &String) -> Result<(), Error> {
+		let _guard = self.swap_lock();
+		if self.swap_active() {
+			return Err(Error::GenericError(
+				"Finish the active swap before changing accounts".into(),
+			));
+		}
 		// Stop service from previous account.
 		let cur_service_id = self.identifier();
 		Tor::stop_service(&cur_service_id);
@@ -840,13 +934,8 @@ impl Wallet {
 			let min_confirmations = self.get_config().min_confirmations;
 			for out_mapping in outputs {
 				let out = out_mapping.output;
-				if out.status == OutputStatus::Unspent {
-					if !out.is_coinbase
-						|| out.lock_height <= current_height
-						|| out.num_confirmations(current_height) >= min_confirmations
-					{
-						spendable += out.value;
-					}
+				if !out.is_multisig && out.eligible_to_spend(current_height, min_confirmations) {
+					spendable += out.value;
 				}
 			}
 			return Ok(spendable);
@@ -1687,9 +1776,12 @@ fn start_sync(wallet: Wallet) -> Thread {
 	wallet.repair_progress.store(0, Ordering::Relaxed);
 
 	// To call on sync thread stop.
-	let on_thread_stop = |wallet: Wallet| {
-		// Clear thread instance.
+	let on_thread_stop = |wallet: &Wallet| {
 		let mut thread_w = wallet.sync_thread.write();
+		// Opening and stopping must agree on the wallet state
+		if wallet.is_open() && !wallet.is_closing() {
+			return false;
+		}
 		*thread_w = None;
 
 		// Clear wallet info.
@@ -1698,6 +1790,7 @@ fn start_sync(wallet: Wallet) -> Thread {
 
 		// Clear syncing status.
 		wallet.syncing.store(false, Ordering::Relaxed);
+		true
 	};
 
 	thread::spawn(move || {
@@ -1712,8 +1805,10 @@ fn start_sync(wallet: Wallet) -> Thread {
 
 			// Stop syncing if wallet was closed.
 			if !wallet.is_open() || wallet.is_closing() {
-				on_thread_stop(wallet);
-				return;
+				if on_thread_stop(&wallet) {
+					return;
+				}
+				continue;
 			}
 
 			// Check integrated node state.
@@ -1738,8 +1833,10 @@ fn start_sync(wallet: Wallet) -> Thread {
 					repair_wallet(&wallet);
 					// Stop sync if wallet was closed.
 					if !wallet.is_open() || wallet.is_closing() {
-						on_thread_stop(wallet);
-						return;
+						if on_thread_stop(&wallet) {
+							return;
+						}
+						continue;
 					}
 				}
 				// Retrieve data from local database if current data is empty.
@@ -1777,8 +1874,10 @@ fn start_sync(wallet: Wallet) -> Thread {
 
 			// Stop sync if wallet was closed.
 			if !wallet.is_open() || wallet.is_closing() {
-				on_thread_stop(wallet);
-				return;
+				if on_thread_stop(&wallet) {
+					return;
+				}
+				continue;
 			}
 
 			// Setup flag to check if sync was failed.
@@ -2307,6 +2406,13 @@ fn update_txs(wallet: &Wallet, mut txs_limit: u32) -> Result<(), Error> {
 			action,
 			action_error,
 		);
+		if matches!(
+			new.swap,
+			Some(super::swaps::SwapTx::Deposit | super::swaps::SwapTx::Transfer)
+		) && tx.tx_type == TxLogEntryType::TxSent
+		{
+			new.amount = new.amount.saturating_sub(tx.fee.map_or(0, |fee| fee.fee()));
+		}
 		// Payment proof setup.
 		if proof.is_none()
 			&& tx.payment_proof.is_some()
@@ -2478,4 +2584,44 @@ fn repair_wallet(wallet: &Wallet) {
 
 	// Reset repair progress.
 	wallet.repair_progress.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod swap_tests {
+	use super::*;
+
+	#[test]
+	fn failed_service() {
+		let root = std::env::temp_dir().join(format!("grim-service-{}", uuid::Uuid::new_v4()));
+		let account = root.join("swaps").join("default".as_bytes().to_hex());
+		std::fs::create_dir_all(&account).unwrap();
+		let state = account.join("session.json");
+		std::fs::write(&state, b"broken").unwrap();
+		let config = serde_json::from_value(serde_json::json!({
+			"account": "default", "chain_type": "Testnet", "id": 0,
+			"name": "service test", "min_confirmations": 2,
+			"data_path": root.to_string_lossy()
+		}))
+		.unwrap();
+		let wallet = Wallet::new(config);
+		let wait = |service: &super::super::swaps::Service| {
+			let start = std::time::Instant::now();
+			while service.alive() {
+				assert!(start.elapsed() < std::time::Duration::from_secs(5));
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			}
+		};
+		let first = wallet.swap_service();
+		wait(&first);
+		let error = first.snapshot().error;
+		assert!(error.is_some());
+		std::fs::remove_file(state).unwrap();
+		let cached = wallet.swap_service();
+		wait(&cached);
+		assert_eq!(cached.snapshot().error, error);
+		let retried = wallet.retry_swaps();
+		wait(&retried);
+		assert!(retried.snapshot().error.is_none());
+		std::fs::remove_dir_all(root).unwrap();
+	}
 }

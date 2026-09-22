@@ -36,6 +36,7 @@ use crate::gui::views::wallets::wallet::message::MessageInputContent;
 use crate::gui::views::wallets::wallet::types::{GRIN, WalletContentContainer};
 use crate::gui::views::{Content, Modal, PullToRefresh, View};
 use crate::wallet::Wallet;
+use crate::wallet::swaps::SwapTx;
 use crate::wallet::types::{WalletData, WalletTask, WalletTx, WalletTxAction};
 
 /// Wallet transactions tab content.
@@ -265,7 +266,7 @@ impl WalletTransactionsContent {
 						r
 					};
 					// Draw button to delete transaction.
-					if tx.data.confirmed || tx.cancelled() {
+					if tx.can_delete() {
 						View::item_button(
 							ui,
 							btn_rounding,
@@ -275,8 +276,8 @@ impl WalletTransactionsContent {
 								self.show_delete_confirmation_modal(tx.data.id);
 							},
 						);
-					} else if !tx.cancelled()
-						&& !tx.cancelling()
+					} else if tx.swap.is_none()
+						&& !tx.cancelled() && !tx.cancelling()
 						&& !tx.posting() && wallet.synced_from_node()
 					{
 						let repeat = tx.broadcasting_timed_out(wallet);
@@ -393,7 +394,9 @@ impl WalletTransactionsContent {
 							ui.add_space(3.0);
 
 							// Setup transaction amount.
-							let mut amount_text = if tx.data.tx_type == TxLogEntryType::TxSent
+							let mut amount_text = if tx.swap == Some(SwapTx::Deposit) {
+								""
+							} else if tx.data.tx_type == TxLogEntryType::TxSent
 								|| tx.data.tx_type == TxLogEntryType::TxSentCancelled
 							{
 								"-"
@@ -574,6 +577,48 @@ impl WalletTransactionsContent {
 								}
 							};
 
+							let status_text = if tx.cancelled() || tx.action.is_some() {
+								status_text
+							} else {
+								let confirmations = tx
+									.height
+									.filter(|h| *h > 0 && *h <= height)
+									.map_or(0, |h| height - h + 1);
+								match tx.swap {
+									Some(SwapTx::Deposit) => format!(
+										"{} · {}/{}",
+										if tx.data.confirmed {
+											t!("swaps.deposit_status")
+										} else {
+											t!("swaps.deposit_pending")
+										},
+										confirmations.min(data.info.minimum_confirmations),
+										data.info.minimum_confirmations
+									),
+									Some(SwapTx::Transfer) if !tx.data.confirmed => {
+										t!("swaps.payout_pending").to_string()
+									}
+									Some(SwapTx::Transfer)
+										if confirmations
+											< data.info.minimum_confirmations.max(1) =>
+									{
+										format!(
+											"{} {}/{}",
+											t!("wallets.tx_confirming"),
+											confirmations,
+											data.info.minimum_confirmations.max(1)
+										)
+									}
+									Some(SwapTx::Recovery) => format!(
+										"{} · {}/{}",
+										t!("swaps.refund_status"),
+										confirmations.min(data.info.minimum_confirmations),
+										data.info.minimum_confirmations
+									),
+									_ => status_text,
+								}
+							};
+
 							// Setup status text color.
 							let status_color = match tx.data.tx_type {
 								TxLogEntryType::ConfirmedCoinbase => Colors::text(false),
@@ -674,6 +719,7 @@ impl WalletTransactionsContent {
 		let txs = data_txs
 			.into_iter()
 			.filter(|tx| tx.data.id == self.confirm_cancel_tx_id.unwrap_or_default())
+			.filter(|tx| tx.swap.is_none())
 			.collect::<Vec<WalletTx>>();
 		if txs.is_empty() {
 			Modal::close();
@@ -748,6 +794,7 @@ impl WalletTransactionsContent {
 		let txs = data_txs
 			.into_iter()
 			.filter(|tx| tx.data.id == self.confirm_delete_tx_id.unwrap_or_default())
+			.filter(|tx| tx.can_delete())
 			.collect::<Vec<WalletTx>>();
 		if txs.is_empty() {
 			Modal::close();
