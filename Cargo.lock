@@ -4141,7 +4141,6 @@ dependencies = [
  "rand 0.6.5",
  "serde",
  "serde_derive",
- "sha2 0.9.9",
  "siphasher 0.3.11",
  "thiserror 1.0.69",
  "zeroize",

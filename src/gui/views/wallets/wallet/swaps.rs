@@ -64,6 +64,7 @@ pub struct SwapContent {
 	offer: Option<Message>,
 	error: Option<String>,
 	abort: bool,
+	withdrawal_fee: u64,
 	page: Page,
 }
 
@@ -132,6 +133,7 @@ impl SwapContent {
 			offer: None,
 			error: None,
 			abort: false,
+			withdrawal_fee: 0,
 			page: Page::Chains,
 		}
 	}
@@ -355,6 +357,32 @@ impl SwapContent {
 				} else {
 					ui.label(format!("{} GRIN ↔ {} BTC", self.grin, self.amount));
 				}
+				if let Some(offer) = &self.offer {
+					let terms = offer.proposal.terms;
+					ui.label(format!(
+						"{}: {}",
+						t!("swaps.grin_confirmations"),
+						terms.confirmations
+					));
+					ui.label(format!(
+						"{}: {}",
+						t!("swaps.bitcoin_confirmations"),
+						terms.bitcoin_confirmations
+					));
+					ui.label(format!("{}: {}", t!("swaps.safety_margin"), terms.margin));
+					ui.label(format!(
+						"{}: {} / {} / {}",
+						t!("swaps.heights"),
+						terms.revoke,
+						terms.refund,
+						terms.timeout
+					));
+				}
+				ui.small(t!("swaps.backup_required"));
+				ui.small(t!("swaps.timeout_risk"));
+				if snapshot.bitcoin.url.starts_with("https://") {
+					ui.small(t!("swaps.remote_trust"));
+				}
 				ui.small(t!("swaps.extra_fees"));
 				ui.add_space(8.0);
 				ui.label(t!("swaps.address_short"));
@@ -530,6 +558,16 @@ impl SwapContent {
 			None
 		};
 		intro(ui, status.phase, t!(status.title), t!(status.hint));
+		if let Some(reply) = view.reply.as_ref().filter(|r| r.funding_recovery) {
+			ui.label(reply.id.to_string());
+			if secondary(ui, t!("swaps.copy_recovery_id")) {
+				cb.copy_string_to_buffer(reply.id.to_string());
+			}
+			ui.hyperlink_to(
+				t!("swaps.recovery_help"),
+				"https://github.com/wiesche89/grin-wallet/blob/atomic_swaps/doc/atomic-swaps-review.md#explicit-recovery-of-extra-bitcoin-outputs",
+			);
+		}
 		if let Some((current, total)) = preparation {
 			ui.label(t!(
 				"swaps.preparation_count",
@@ -546,6 +584,32 @@ impl SwapContent {
 		ui.small(t!(role_hint(view.role, "swaps.selling", "swaps.buying")));
 		ui.add_space(12.0);
 		chain_status(ui, view);
+		if let Some(payout) = view.reply.as_ref().and_then(|r| r.payout.as_ref()) {
+			ui.label(t!(
+				"swaps.payout_confirmations",
+				count = match payout.status {
+					TxState::Confirmed(n) => n,
+					_ => 0,
+				},
+				required = p.terms.bitcoin_confirmations
+			));
+			if payout.can_replace
+				&& !matches!(payout.status, TxState::Confirmed(_))
+				&& payout.fee < payout.max_fee
+			{
+				self.withdrawal_fee = self.withdrawal_fee.max(payout.fee + 1).min(payout.max_fee);
+				ui.label(t!("swaps.payout_fee"));
+				ui.add(
+					egui::DragValue::new(&mut self.withdrawal_fee)
+						.range((payout.fee + 1)..=payout.max_fee),
+				);
+				if action(ui, busy, t!("swaps.bump_fee")) {
+					self.send(Command::Withdraw {
+						fee: self.withdrawal_fee,
+					});
+				}
+			}
+		}
 		if view.ready && !view.cancelled {
 			if !view.armed && !view.stopped {
 				if !pending

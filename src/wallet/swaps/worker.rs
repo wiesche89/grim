@@ -255,6 +255,7 @@ impl Worker {
 				if !tip.updated_from_node || !offer.proposal.terms.open(tip.height) {
 					return Err(fail("Offer expired or node unavailable"));
 				}
+				self.timing.accepts(offer.proposal.terms, tip.height)?;
 				self.session = Some(Session {
 					preparation: Preparation::accept(&offer, address)?,
 					release: None,
@@ -270,7 +271,49 @@ impl Worker {
 			Some(Command::Import(text)) => {
 				self.receive(api, owner, mask, Packet::decode(&text)?)?;
 			}
+			Some(Command::Withdraw { fee }) => {
+				let session = self.session.as_mut().ok_or_else(|| fail("No swap"))?;
+				let id = session
+					.preparation
+					.swap
+					.ok_or_else(|| fail("Swap is not ready"))?;
+				session.paid = false;
+				let reply = owner.sas(mask, Request::Withdraw { id, fee })?;
+				self.reply = Some(reply);
+				self.store()?;
+			}
 			Some(Command::Archive) => {
+				if let Some(session) = self
+					.session
+					.as_ref()
+					.filter(|s| s.preparation.ready && s.armed && !s.cancelled)
+				{
+					let id = session
+						.preparation
+						.swap
+						.ok_or_else(|| fail("Missing swap id"))?;
+					self.reply = Some(owner.sas(mask, Request::Step { id })?);
+					self.updated = Some(Instant::now());
+				}
+				// A saved broadcast flag is not proof of confirmation after restart or reorg.
+				if let Some(session) = self
+					.session
+					.as_mut()
+					.filter(|s| owns_bitcoin(s.preparation.role, self.reply.as_ref()))
+				{
+					session.paid = false;
+					let id = session
+						.preparation
+						.swap
+						.ok_or_else(|| fail("Missing swap id"))?;
+					let reply = owner.sas(mask, Request::WithdrawAuto { id })?;
+					session.paid = payout_confirmed(
+						&reply,
+						session.preparation.proposal.terms.bitcoin_confirmations,
+					);
+					self.reply = Some(reply);
+					self.store()?;
+				}
 				let Some(s) = self.session.as_ref().filter(|s| {
 					finished(s.preparation.role, self.reply.as_ref(), s.cancelled, s.paid)
 				}) else {
@@ -375,8 +418,9 @@ impl Worker {
 		if let Some(session) = self
 			.session
 			.as_mut()
-			.filter(|s| owns_bitcoin(s.preparation.role, self.reply.as_ref()) && !s.paid)
+			.filter(|s| owns_bitcoin(s.preparation.role, self.reply.as_ref()))
 		{
+			session.paid = false;
 			let mut reply = owner.sas(
 				mask,
 				Request::WithdrawAuto {
@@ -387,11 +431,63 @@ impl Worker {
 				},
 			)?;
 			reply.chain = self.reply.as_ref().and_then(|r| r.chain.clone());
+			reply.grin = self.reply.as_ref().and_then(|r| r.grin);
+			session.paid = payout_confirmed(
+				&reply,
+				session.preparation.proposal.terms.bitcoin_confirmations,
+			);
 			self.reply = Some(reply);
-			session.paid = true;
 			self.store()?;
 		}
 
 		Ok(())
+	}
+}
+
+fn payout_confirmed(reply: &Reply, confirmations: u64) -> bool {
+	reply
+		.payout
+		.as_ref()
+		.is_some_and(|p| p.status.confirmed(confirmations))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use grin_wallet_api::swap::sas::Payout;
+	use grin_wallet_libwallet::swap::{Action, TxState};
+	#[test]
+	fn payout_requires_fresh_confirmations() {
+		let mut reply = Reply {
+			grin: None,
+			funding_recovery: false,
+			id: uuid::Uuid::new_v4(),
+			key: String::new(),
+			action: Action::Complete,
+			chain: None,
+			withdrawal: Some("saved transaction".into()),
+			payout: None,
+			payment: None,
+			proof: None,
+			funding: Some("funding".into()),
+			main: None,
+		};
+		assert!(!payout_confirmed(&reply, 2));
+		for (status, confirmed) in [
+			(TxState::Absent, false),
+			(TxState::Pending, false),
+			(TxState::Confirmed(1), false),
+			(TxState::Confirmed(2), true),
+			(TxState::Conflicted, false),
+		] {
+			reply.payout = Some(Payout {
+				status,
+				fee: 222,
+				max_fee: 5000,
+				can_replace: true,
+			});
+			assert_eq!(payout_confirmed(&reply, 2), confirmed);
+			assert!(!payout_confirmed(&reply, 0));
+		}
 	}
 }

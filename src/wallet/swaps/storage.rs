@@ -62,6 +62,14 @@ pub(super) fn private_dir(path: &Path) -> Result<(), Error> {
 }
 
 pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+	write_checkpointed(path, bytes, |_| {})
+}
+
+fn write_checkpointed(
+	path: &Path,
+	bytes: &[u8],
+	mut checkpoint: impl FnMut(&str),
+) -> Result<(), Error> {
 	let parent = path
 		.parent()
 		.ok_or_else(|| fail("Missing swap directory"))?;
@@ -76,12 +84,16 @@ pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 		}
 		let mut file = options.open(&tmp).map_err(fail)?;
 		file.write_all(bytes).map_err(fail)?;
+		checkpoint("written");
 		file.sync_all().map_err(fail)?;
+		checkpoint("synced");
 		fs::rename(&tmp, path).map_err(fail)?;
+		checkpoint("renamed");
 		#[cfg(unix)]
 		File::open(parent)
 			.and_then(|f| f.sync_all())
 			.map_err(fail)?;
+		checkpoint("durable");
 		Ok(())
 	})();
 	if result.is_err() {
@@ -92,4 +104,77 @@ pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 
 pub(super) fn save<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
 	write(path, &serde_json::to_vec(value).map_err(fail)?)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	#[ignore = "child process for interrupted_write"]
+	fn crash_child() {
+		let Ok(root) = std::env::var("GRIM_SWAP_CRASH_TEST_ROOT") else {
+			return;
+		};
+		let stage = std::env::var("GRIM_SWAP_CRASH_TEST_STAGE").unwrap();
+		let root = Path::new(&root);
+		write_checkpointed(&root.join("session.json"), b"[2]", |point| {
+			if point == stage {
+				fs::write(root.join("ready"), b"ready").unwrap();
+				loop {
+					std::thread::park();
+				}
+			}
+		})
+		.unwrap();
+	}
+
+	#[test]
+	fn interrupted_write() {
+		use std::process::{Command, Stdio};
+		use std::time::{Duration, Instant};
+		for (stage, expected) in [
+			("written", 1),
+			("synced", 1),
+			("renamed", 2),
+			("durable", 2),
+		] {
+			let root = std::env::temp_dir().join(format!("grim-crash-{}", Uuid::new_v4()));
+			private_dir(&root).unwrap();
+			let path = root.join("session.json");
+			save(&path, &vec![1u64]).unwrap();
+			let mut child = Command::new(std::env::current_exe().unwrap())
+				.args([
+					"--ignored",
+					"--exact",
+					"wallet::swaps::storage::tests::crash_child",
+				])
+				.env("GRIM_SWAP_CRASH_TEST_ROOT", &root)
+				.env("GRIM_SWAP_CRASH_TEST_STAGE", stage)
+				.stdout(Stdio::null())
+				.stderr(Stdio::null())
+				.spawn()
+				.unwrap();
+			let deadline = Instant::now() + Duration::from_secs(60);
+			while !root.join("ready").exists() && Instant::now() < deadline {
+				if child.try_wait().unwrap().is_some() {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			let reached = root.join("ready").exists();
+			let _ = child.kill();
+			child.wait().unwrap();
+			assert!(reached, "child did not reach {stage}");
+			// A killed writer may leave a temporary file. The loader must still
+			// read only the complete old or new session at its committed path.
+			assert_eq!(
+				read_optional::<Vec<u64>>(&path).unwrap(),
+				Some(vec![expected])
+			);
+			save(&path, &vec![3u64]).unwrap();
+			assert_eq!(read::<Vec<u64>>(&path).unwrap(), vec![3]);
+			fs::remove_dir_all(root).unwrap();
+		}
+	}
 }

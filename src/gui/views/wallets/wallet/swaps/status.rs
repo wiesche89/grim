@@ -120,7 +120,11 @@ pub(super) fn next(view: &SwapView) -> Option<&'static str> {
 pub(super) fn phase(view: &SwapView) -> Option<u8> {
 	let action = view.reply.as_ref().map(|r| r.action);
 	if view.cancelled
-		|| view.stopped
+		|| view.reply.as_ref().and_then(|r| r.grin).is_some_and(|g| {
+			g.revoke != TxState::Absent
+				|| g.refund != TxState::Absent
+				|| g.timeout != TxState::Absent
+		}) || view.stopped
 		|| matches!(
 			action,
 			Some(
@@ -135,8 +139,11 @@ pub(super) fn phase(view: &SwapView) -> Option<u8> {
 		None
 	} else if view.finished() {
 		Some(3)
-	} else if view.last_chain().is_some_and(|c| matches!(c.status.bitcoin, TxState::Confirmed(n) if n >= view.proposal.terms.bitcoin_confirmations))
-		|| matches!(view.outgoing, Some(Packet::Release { .. }))
+	} else if view.chain().is_some_and(|c| {
+		c.status
+			.bitcoin
+			.confirmed(view.proposal.terms.bitcoin_confirmations)
+	}) || matches!(view.outgoing, Some(Packet::Release { .. }))
 		|| matches!(
 			action,
 			Some(
@@ -166,6 +173,11 @@ fn guide(
 		("swaps.cancelled", "swaps.cancel_hint")
 	} else if action == Some(Action::TimedOut) {
 		("swaps.timeout_title", "swaps.timeout_hint")
+	} else if view.reply.as_ref().is_some_and(|r| r.funding_recovery) {
+		(
+			"swaps.funding_recovery_title",
+			"swaps.funding_recovery_hint",
+		)
 	} else if view.owns_bitcoin() && !view.paid {
 		("swaps.withdraw_title", "swaps.withdraw_hint")
 	} else if view.finished() {
@@ -280,8 +292,11 @@ mod tests {
 			cancelled: false,
 			updated: None,
 			reply: Some(grin_wallet_api::swap::Reply {
+				grin: None,
+				funding_recovery: false,
 				chain: None,
 				withdrawal: None,
+				payout: None,
 				id,
 				action,
 				proof: None,
@@ -295,6 +310,41 @@ mod tests {
 
 	fn chain_state(view: &mut SwapView) -> &mut grin_wallet_libwallet::swap::sas::View {
 		&mut view.reply.as_mut().unwrap().chain.as_mut().unwrap().status
+	}
+
+	#[test]
+	fn recovery_wait_without_bitcoin() {
+		let mut v = view(Action::Wait);
+		v.outgoing = None;
+		assert_eq!(Status::new(&v, None, false).hint, "swaps.chain_wait");
+		v.reply.as_mut().unwrap().grin = Some(grin_wallet_libwallet::swap::sas::GrinView {
+			height: 2050,
+			funding: TxState::Confirmed(100),
+			success: TxState::Absent,
+			revoke: TxState::Confirmed(2),
+			refund: TxState::Absent,
+			timeout: TxState::Absent,
+			funded: false,
+			revoked: true,
+		});
+		assert_eq!(Status::new(&v, None, false).hint, "swaps.recovery_seller");
+		v.role = Role::BuyGrin;
+		assert_eq!(Status::new(&v, None, false).hint, "swaps.recovery_buyer");
+		v.reply.as_mut().unwrap().grin = None;
+		assert_eq!(Status::new(&v, None, false).hint, "swaps.chain_wait");
+	}
+
+	#[test]
+	fn missing_funding_offers_manual_recovery() {
+		let mut v = view(Action::Refunded);
+		v.role = Role::BuyGrin;
+		v.reply.as_mut().unwrap().funding_recovery = true;
+		assert!(!v.finished());
+		let status = Status::new(&v, None, false);
+		assert_eq!(status.title, "swaps.funding_recovery_title");
+		assert_eq!(status.hint, "swaps.funding_recovery_hint");
+		v.reply.as_mut().unwrap().funding_recovery = false;
+		assert_eq!(Status::new(&v, None, false).hint, "swaps.withdraw_hint");
 	}
 
 	#[test]
@@ -379,7 +429,7 @@ mod tests {
 		assert!(explorer(v.chain().unwrap()).is_none());
 		v.updated = Some(std::time::Instant::now() - Duration::from_secs(11));
 		assert!(v.chain().is_none());
-		assert_eq!(phase(&v), Some(2));
+		assert_eq!(phase(&v), Some(1));
 		assert_eq!(next(&v), Some("swaps.chain_wait"));
 		v.updated = Some(std::time::Instant::now());
 		chain_state(&mut v).success = TxState::Pending;

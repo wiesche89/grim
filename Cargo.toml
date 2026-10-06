@@ -33,7 +33,7 @@ grin_api = { path = "wallet/grin/api" }
 grin_chain = { path = "wallet/grin/chain" }
 grin_config = { path = "wallet/grin/config" }
 grin_core = { path = "wallet/grin/core" }
-grin_p2p = { path = "wallet/grin/p2p" }
+grin_p2p = { path = "wallet/grin/p2p", features = ["grim"] }
 grin_servers = { path = "wallet/grin/servers" }
 grin_keychain = { path = "wallet/grin/keychain" }
 grin_util = { path = "wallet/grin/util" }

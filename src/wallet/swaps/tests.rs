@@ -102,6 +102,7 @@ fn slatepacks() -> Result<(), Error> {
 	save(&seller.root.join("timing.json"), &seller.timing)?;
 	seller.timing = read(&seller.root.join("timing.json"))?;
 	let mut buyer = worker("b");
+	buyer.timing = seller.timing;
 	let address = bitcoin(&["getnewaddress"]).as_str().unwrap().to_owned();
 	let offer = || Command::Create {
 		grin: 5_012_500_000,
@@ -347,7 +348,7 @@ fn slatepacks() -> Result<(), Error> {
 	}
 	assert!(seller.view().unwrap().owns_bitcoin());
 	assert!(buyer.view().unwrap().finished());
-	assert!(seller.view().unwrap().paid);
+	assert!(!seller.view().unwrap().paid);
 	assert!(seller.reply.as_ref().unwrap().withdrawal.is_some());
 	let payout_id = seller.reply.as_ref().unwrap().withdrawal.clone().unwrap();
 	let payout = bitcoin(&["getrawtransaction", &payout_id, "true"]);
@@ -355,24 +356,44 @@ fn slatepacks() -> Result<(), Error> {
 	let payout_fee = 100_000 - payout_sats;
 	assert_eq!(payout_fee, payout["vsize"].as_u64().unwrap() * 2);
 	assert!(payout_fee <= 5000);
-	assert!(seller.view().unwrap().finished());
-	// Resume after broadcast without the GUI checkpoint
-	seller.session.as_mut().unwrap().paid = false;
+	assert!(!seller.view().unwrap().finished());
+	assert!(
+		seller
+			.advance(&a, &fa, am, &config, Some(Command::Archive))
+			.is_err()
+	);
+	// Older versions persisted paid=true immediately after broadcast.
+	// On resume this must not bypass confirmation monitoring.
+	seller.session.as_mut().unwrap().paid = true;
 	seller.store()?;
 	seller.session = Some(read(&seller.root.join("session.json"))?);
 	seller.reply = None;
 	seller.updated = None;
 	seller.advance(&a, &fa, am, &config, None)?;
-	assert!(seller.view().unwrap().paid);
+	assert!(!seller.view().unwrap().paid);
 	assert_eq!(
 		seller.reply.as_ref().unwrap().withdrawal.as_ref(),
 		Some(&payout_id)
 	);
 	bitcoin(&["-generate", "3"]);
+	seller.advance(&a, &fa, am, &config, None)?;
+	assert!(seller.view().unwrap().paid);
 	assert_eq!(
 		bitcoin(&["getreceivedbyaddress", &address, "1", "true"]).as_f64(),
 		Some((100_000 - payout_fee) as f64 / 100_000_000.0)
 	);
+	// Confirmation loss must be detected even when the cached view allowed archiving.
+	let height = bitcoin(&["getblockcount"]).as_u64().unwrap();
+	let block = bitcoin(&["getblockhash", &(height - 2).to_string()]);
+	bitcoin(&["invalidateblock", block.as_str().unwrap()]);
+	assert!(
+		seller
+			.advance(&a, &fa, am, &config, Some(Command::Archive))
+			.is_err()
+	);
+	assert!(!seller.view().unwrap().paid);
+	assert!(seller.session.is_some());
+	bitcoin(&["-generate", "3"]);
 	seller.advance(&a, &fa, am, &config, Some(Command::Archive))?;
 	assert!(seller.session.is_none());
 	running.store(false, Ordering::Relaxed);
@@ -398,7 +419,7 @@ fn payment() {
 				timeout: 140,
 				confirmations: 2,
 				bitcoin_confirmations: 2,
-				margin: 3,
+				margin: 12,
 			},
 		},
 		address: String::new(),
@@ -411,8 +432,11 @@ fn payment() {
 		cancelled: false,
 		updated: Some(Instant::now()),
 		reply: Some(Reply {
+			grin: None,
+			funding_recovery: false,
 			chain: None,
 			withdrawal: None,
+			payout: None,
 			id,
 			key: String::new(),
 			proof: None,
@@ -488,6 +512,11 @@ fn commands() {
 	drop(rx);
 	assert!(service.send(Command::Retry).is_err());
 	assert!(!service.snapshot().busy);
+	service.active.store(true, Ordering::SeqCst);
+	service.load_failed(&fail("broken session"));
+	assert!(!service.active());
+	assert!(!service.alive());
+	assert!(service.snapshot().error.unwrap().contains("broken session"));
 }
 
 #[test]

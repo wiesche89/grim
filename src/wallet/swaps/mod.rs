@@ -265,6 +265,9 @@ pub enum Command {
 	Import(String),
 	Start,
 	Abort,
+	Withdraw {
+		fee: u64,
+	},
 	Archive,
 	Retry,
 }
@@ -319,6 +322,14 @@ impl Service {
 		snapshot.busy = true;
 		Ok(receipt)
 	}
+	fn load_failed(&self, error: &Error) {
+		let mut snapshot = self.snapshot.write();
+		snapshot.error = Some(error.to_string());
+		snapshot.busy = false;
+		self.active.store(false, Ordering::SeqCst);
+		self.alive.store(false, Ordering::SeqCst);
+	}
+
 	pub(crate) fn start(wallet: Wallet) -> Self {
 		let config = wallet.get_config();
 		let account = config.account.as_bytes().to_hex();
@@ -346,10 +357,7 @@ impl Service {
 			let (mut worker, bitcoin) = match Worker::load(root) {
 				Ok(loaded) => loaded,
 				Err(error) => {
-					let mut snapshot = shared.snapshot.write();
-					snapshot.error = Some(error.to_string());
-					snapshot.busy = false;
-					shared.alive.store(false, Ordering::SeqCst);
+					shared.load_failed(&error);
 					return;
 				}
 			};

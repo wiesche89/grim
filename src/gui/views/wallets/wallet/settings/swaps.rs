@@ -118,6 +118,9 @@ impl SwapSettings {
 				ui.small(t!("swaps.mainnet_unavailable"));
 				let mut remote = config.url.starts_with("https://");
 				let was_remote = remote;
+				if remote {
+					ui.small(t!("swaps.remote_trust"));
+				}
 				ui.add_space(4.0);
 				let width = ui.available_width().min(360.0);
 				ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
